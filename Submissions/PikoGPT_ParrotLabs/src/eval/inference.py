@@ -8,9 +8,8 @@ import torch
 
 log = logging.getLogger("parrotllm.inference")
 
-from configs import ProjectConfig
-from src.model import HuggingFaceGPT2, ParrotLLM
-from src.utils import build_tokenizer, maybe_load_hf_token
+from src.model import ParrotLLM
+from src.utils import build_tokenizer
 
 
 def _build_ngram_map(seq: list[int], n: int) -> dict[tuple, set[int]]:
@@ -435,33 +434,21 @@ def mc_first_token_ids(tokenizer, letters: list[str]) -> set[int]:
 
 
 def run_inference(
-    project_config: ProjectConfig,
+    project_config,
     *,
-    checkpoint: str | None,
+    checkpoint: str,
     device: torch.device,
     prompt: str | None,
     max_tokens_override: int | None,
     temperature_override: float | None,
     leaderboard: bool,
-    mock_testing: bool,
-    hf_token: str | None = None,
 ) -> None:
     inference_cfg = project_config.inference
     if inference_cfg is None:
         raise ValueError("Inference configuration missing; cannot run inference stage.")
 
-    use_mock = mock_testing
-
-    if use_mock:
-        if hf_token:
-            log.info("Using Hugging Face token from .env")
-        model = HuggingFaceGPT2().to(device)
-        mc = {"context_length": getattr(model, "context_length", 1024)}
-        log.info("mock_testing enabled: using openai-community/gpt2")
-    else:
-        assert checkpoint, "--checkpoint required for inference"
-        model, ckpt_config = load_model_from_checkpoint(checkpoint, device)
-        mc = ckpt_config["model"]
+    model, ckpt_config = load_model_from_checkpoint(checkpoint, device)
+    mc = ckpt_config["model"]
     model.eval()
 
     tokenizer = build_tokenizer()
