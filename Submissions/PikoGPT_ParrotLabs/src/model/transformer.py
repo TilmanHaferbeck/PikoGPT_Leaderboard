@@ -1,6 +1,5 @@
 """ParrotLLM transformer — a decoder-only language model."""
 
-import gc
 import math
 
 import torch
@@ -47,10 +46,41 @@ def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     x: (B, n_heads, T, d_head)
     freqs_cis: (T, d_head // 2) complex
     """
-    x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(0)  # (1, 1, T, d_head//2)
-    x_rotated = x_complex * freqs_cis
-    return torch.view_as_real(x_rotated).reshape(x.shape).type_as(x)
+    x_float = x.float()
+    x_even = x_float[..., 0::2]
+    x_odd = x_float[..., 1::2]
+
+    # Real-valued form of complex multiply:
+    # (x_even + i*x_odd) * (cos + i*sin).
+    # Keeping complex tensors out of the autograd graph is materially more
+    # stable on MPS while producing the same rotation.
+    freqs = torch.view_as_real(freqs_cis).to(device=x.device)
+    cos = freqs[..., 0].unsqueeze(0).unsqueeze(0)
+    sin = freqs[..., 1].unsqueeze(0).unsqueeze(0)
+
+    rotated = torch.empty_like(x_float)
+    rotated[..., 0::2] = x_even * cos - x_odd * sin
+    rotated[..., 1::2] = x_even * sin + x_odd * cos
+    return rotated.type_as(x)
+
+
+def causal_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
+                     dropout_p: float = 0.0) -> torch.Tensor:
+    """Causal attention with an MPS-stable fallback for training."""
+    if q.device.type != "mps":
+        return F.scaled_dot_product_attention(
+            q, k, v, is_causal=True, dropout_p=dropout_p,
+        )
+
+    scale = 1.0 / math.sqrt(q.size(-1))
+    scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale
+    T = q.size(-2)
+    causal_mask = torch.ones((T, T), device=q.device, dtype=torch.bool).triu(1)
+    scores = scores.masked_fill(causal_mask, torch.finfo(scores.dtype).min)
+    attn = torch.softmax(scores, dim=-1).type_as(v)
+    if dropout_p > 0.0:
+        attn = F.dropout(attn, p=dropout_p, training=True)
+    return torch.matmul(attn, v)
 
 
 # ── Multi-Head Attention ─────────────────────────────────────────────────────
@@ -69,7 +99,7 @@ class MultiHeadAttention(nn.Module):
         self.o_proj = nn.Linear(d_model, d_model, bias=bias)
 
         # QK-Norm: bound attention logit magnitude for training stability at depth
-        # (Dehghani et al., arXiv:2302.05442). Applied before RoPE, after projection.
+        # (Dehghani et al., arXiv:2302.05442). Applied after RoPE, before attention.
         self.q_norm = RMSNorm(self.d_head)
         self.k_norm = RMSNorm(self.d_head)
 
@@ -83,19 +113,72 @@ class MultiHeadAttention(nn.Module):
         k = self.k_proj(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
 
-        # Apply QK-Norm then RoPE (norm-before-rotation, as in Gemma 3/4 and OLMo 2)
-        q = apply_rope(self.q_norm(q), freqs_cis)
-        k = apply_rope(self.k_norm(k), freqs_cis)
+        # Apply RoPE then QK-Norm to Q and K
+        q = self.q_norm(apply_rope(q, freqs_cis))
+        k = self.k_norm(apply_rope(k, freqs_cis))
 
-        # Causal self-attention; Flash Attention if available
-        out = F.scaled_dot_product_attention(
-            q, k, v, is_causal=True,
+        # Causal self-attention. CUDA/CPU use SDPA; MPS training uses the
+        # explicit math path because SDPA backward can produce non-finite grads.
+        out = causal_attention(
+            q,
+            k,
+            v,
             dropout_p=self.attn_dropout if self.training else 0.0,
         )
 
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         out = self.resid_dropout(self.o_proj(out))
         return out
+
+    def forward_with_cache(
+        self,
+        x: torch.Tensor,
+        freqs_cis_slice: torch.Tensor,
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Inference forward with optional KV-cache (VL09 slide 34).
+
+        Two operating modes:
+          - **Prefill** (``past_kv is None``): ``x`` is the full prompt;
+            standard causal self-attention. Returns the freshly-built
+            (k, v) for the next call.
+          - **Decode** (``past_kv`` provided): ``x`` is just the new tokens
+            (typically a single token, B=1). New k/v are concatenated with
+            the cached past, the new query attends to the entire history,
+            and the extended (k, v) is returned.
+
+        ``freqs_cis_slice`` must contain the RoPE frequencies for the
+        positions occupied by ``x`` (i.e. ``freqs_cis[past_T:past_T+T]``).
+        Caller (``ParrotLLM.forward_with_cache``) handles the slicing.
+        """
+        B, T, C = x.shape
+
+        q = self.q_proj(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+
+        # RoPE+QK-Norm only on the NEW slice; past_k is already rotated.
+        q = self.q_norm(apply_rope(q, freqs_cis_slice))
+        k = self.k_norm(apply_rope(k, freqs_cis_slice))
+
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k = torch.cat([past_k, k], dim=2)
+            v = torch.cat([past_v, v], dim=2)
+        new_kv = (k, v)
+
+        if past_kv is None:
+            # Square attention: q and k both length T.
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            # Decode: q (length T, typically 1) attends to all of k. No
+            # mask needed when T==1; for T>1 with cache we do not support
+            # this path (no caller does it today).
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
+        out = self.o_proj(out)
+        return out, new_kv
 
 
 # ── SwiGLU MLP ───────────────────────────────────────────────────────────────
@@ -151,6 +234,23 @@ class TransformerBlock(nn.Module):
             mlp_out = self.ln_2_out(mlp_out)
         x = x + mlp_out
         return x
+
+    def forward_with_cache(
+        self,
+        x: torch.Tensor,
+        freqs_cis_slice: torch.Tensor,
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        attn_out, new_kv = self.attn.forward_with_cache(
+            self.ln_1(x), freqs_cis_slice, past_kv,
+        )
+        x = x + self.ln_1_out(attn_out)
+        mlp_in = self.ln_2(x) if hasattr(self, "ln_2") else x
+        mlp_out = self.mlp(mlp_in)
+        if hasattr(self, "ln_2_out"):
+            mlp_out = self.ln_2_out(mlp_out)
+        x = x + mlp_out
+        return x, new_kv
 
 
 # ── ParrotLLM ────────────────────────────────────────────────────────────────
@@ -209,85 +309,76 @@ class ParrotLLM(nn.Module):
         hidden: torch.Tensor,
         targets: torch.Tensor,
         *,
-        loss_mask: torch.Tensor | None = None,
         z_loss_coeff: float = 0.0,
         loss_chunk_rows: int = 2048,
     ) -> torch.Tensor:
         """Compute CE (+ optional z-loss) without materializing full-sequence logits."""
         flat_hidden = hidden.reshape(-1, hidden.size(-1))
         flat_targets = targets.reshape(-1)
-        flat_mask = loss_mask.reshape(-1).to(dtype=torch.float32) if loss_mask is not None else None
 
         total_ce = torch.zeros((), device=hidden.device, dtype=torch.float32)
         total_z = torch.zeros((), device=hidden.device, dtype=torch.float32)
-        denom = flat_mask.sum().clamp_min(1.0) if flat_mask is not None else torch.tensor(
-            float(flat_targets.numel()),
-            device=hidden.device,
-            dtype=torch.float32,
-        )
-
-        def accumulate_chunk(
-            hidden_chunk: torch.Tensor,
-            target_chunk: torch.Tensor,
-            mask_chunk: torch.Tensor | None,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            try:
-                logits_chunk = F.linear(hidden_chunk, self.lm_head.weight, self.lm_head.bias)
-                ce_chunk = F.cross_entropy(
-                    logits_chunk,
-                    target_chunk,
-                    reduction="none",
-                )
-                ce_total = (ce_chunk * mask_chunk).sum() if mask_chunk is not None else ce_chunk.sum()
-
-                z_total = torch.zeros((), device=hidden_chunk.device, dtype=torch.float32)
-                if z_loss_coeff > 0.0:
-                    z_chunk = torch.logsumexp(logits_chunk.float(), dim=-1).pow(2)
-                    z_total = (z_chunk * mask_chunk).sum() if mask_chunk is not None else z_chunk.sum()
-                return ce_total, z_total
-            except RuntimeError as exc:
-                if "MPS backend out of memory" not in str(exc) or hidden_chunk.size(0) <= 1:
-                    raise
-                if hidden_chunk.device.type == "mps":
-                    gc.collect()
-                    torch.mps.empty_cache()
-                midpoint = hidden_chunk.size(0) // 2
-                left_ce, left_z = accumulate_chunk(
-                    hidden_chunk[:midpoint],
-                    target_chunk[:midpoint],
-                    mask_chunk[:midpoint] if mask_chunk is not None else None,
-                )
-                right_ce, right_z = accumulate_chunk(
-                    hidden_chunk[midpoint:],
-                    target_chunk[midpoint:],
-                    mask_chunk[midpoint:] if mask_chunk is not None else None,
-                )
-                return left_ce + right_ce, left_z + right_z
 
         for start in range(0, flat_hidden.size(0), loss_chunk_rows):
             stop = start + loss_chunk_rows
             hidden_chunk = flat_hidden[start:stop]
             target_chunk = flat_targets[start:stop]
-            mask_chunk = flat_mask[start:stop] if flat_mask is not None else None
-            ce_total, z_total = accumulate_chunk(hidden_chunk, target_chunk, mask_chunk)
-            total_ce = total_ce + ce_total
-            total_z = total_z + z_total
+            logits_chunk = F.linear(hidden_chunk, self.lm_head.weight, self.lm_head.bias)
 
-        loss = total_ce / denom
+            total_ce = total_ce + F.cross_entropy(
+                logits_chunk,
+                target_chunk,
+                reduction="sum",
+            )
+            if z_loss_coeff > 0.0:
+                total_z = total_z + torch.logsumexp(
+                    logits_chunk.float(), dim=-1
+                ).pow(2).sum()
+
+        loss = total_ce / flat_targets.numel()
         if z_loss_coeff > 0.0:
-            loss = loss + z_loss_coeff * (total_z / denom)
+            loss = loss + z_loss_coeff * (total_z / flat_targets.numel())
         return loss
 
-    def forward(
+    def _compute_labels_loss_in_chunks(
         self,
-        idx: torch.Tensor,
-        targets: torch.Tensor | None = None,
+        hidden: torch.Tensor,
+        labels: torch.Tensor,
         *,
-        loss_mask: torch.Tensor | None = None,
-        return_logits: bool = True,
-        z_loss_coeff: float = 0.0,
         loss_chunk_rows: int = 2048,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> torch.Tensor:
+        """Compute shifted, masked CE for HF-style labels without full logits."""
+        shift_hidden = hidden[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+
+        flat_hidden = shift_hidden.reshape(-1, shift_hidden.size(-1))
+        flat_labels = shift_labels.reshape(-1)
+
+        total_ce = torch.zeros((), device=hidden.device, dtype=torch.float32)
+        supervised = (flat_labels != -100).sum().to(dtype=torch.float32)
+
+        for start in range(0, flat_hidden.size(0), loss_chunk_rows):
+            stop = start + loss_chunk_rows
+            hidden_chunk = flat_hidden[start:stop]
+            label_chunk = flat_labels[start:stop]
+
+            supervised_mask = label_chunk != -100
+            if not bool(supervised_mask.any().item()):
+                continue
+            hidden_chunk = hidden_chunk[supervised_mask]
+            label_chunk = label_chunk[supervised_mask]
+            logits_chunk = F.linear(hidden_chunk, self.lm_head.weight, self.lm_head.bias)
+
+            total_ce = total_ce + F.cross_entropy(
+                logits_chunk,
+                label_chunk,
+                reduction="sum",
+            )
+
+        return total_ce / supervised
+
+    def forward_hidden(self, idx: torch.Tensor) -> torch.Tensor:
+        """Return final hidden states before the language-model head."""
         _, T = idx.shape
 
         x = self.dropout(self.tok_emb(idx))
@@ -304,7 +395,54 @@ class ParrotLLM(nn.Module):
 
         if hasattr(self, "ln_f"):
             x = self.ln_f(x)
+        return x
 
+    def forward(
+        self,
+        idx: torch.Tensor,
+        targets: torch.Tensor | None = None,
+        *,
+        labels: torch.Tensor | None = None,
+        return_logits: bool = True,
+        z_loss_coeff: float = 0.0,
+        loss_chunk_rows: int = 2048,
+    ) -> tuple[torch.Tensor, torch.Tensor | None] | torch.Tensor:
+        """Forward pass.
+
+        Two calling conventions are supported so a single forward serves both
+        pretraining and SFT:
+
+        - ``targets``: pre-shifted labels the same length as ``idx``, no
+          masking. Used by the pretraining trainer which pre-shifts windows
+          inside the DataLoader (``chunk[:-1], chunk[1:]``).
+
+        - ``labels``: HuggingFace convention — ``labels[t] == idx[t]`` on
+          positions that contribute to the loss, ``labels[t] == -100`` on
+          positions to ignore (``F.cross_entropy(ignore_index=-100)``). The
+          shift between predictions and labels is performed here. This is
+          what the SFT collator produces (VL07 slide 15 masked loss).
+
+        When ``labels`` is given, the function returns **the loss tensor only**
+        so the SFT trainer can call ``model(ids, labels=labels)`` ergonomically.
+        When ``targets`` is given (legacy pretraining path), it returns
+        ``(logits, loss)`` as before.
+        """
+        x = self.forward_hidden(idx)
+
+        # ── SFT path (HuggingFace labels convention, VL07 slide 15) ─────────
+        if labels is not None:
+            # Shift so position t predicts token at t+1, matching the
+            # next-token objective. Positions with label=-100 are skipped
+            # via `ignore_index=-100` in F.cross_entropy, which is the
+            # exact mechanism VL07 slide 15 prescribes ("Instruction tokens
+            # are masked with label = −100").
+            return self._compute_labels_loss_in_chunks(
+                x,
+                labels,
+                loss_chunk_rows=loss_chunk_rows,
+            )
+
+        # ── Pretraining path (pre-shifted targets) ──────────────────────────
         logits = self.lm_head(x) if (targets is None or return_logits) else None
         loss = None
         if targets is not None:
@@ -312,28 +450,17 @@ class ParrotLLM(nn.Module):
                 loss = self._compute_loss_in_chunks(
                     x,
                     targets,
-                    loss_mask=loss_mask,
                     z_loss_coeff=z_loss_coeff,
                     loss_chunk_rows=loss_chunk_rows,
                 )
             else:
-                losses = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    targets.view(-1),
-                    reduction="none",
-                ).view_as(targets)
-                if loss_mask is not None:
-                    denom = loss_mask.sum().clamp_min(1.0)
-                    loss = (losses * loss_mask).sum() / denom
-                else:
-                    loss = losses.mean()
+                loss = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)), targets.view(-1)
+                )
                 if z_loss_coeff > 0.0:
-                    z_term = torch.logsumexp(logits.float(), dim=-1).pow(2)
-                    if loss_mask is not None:
-                        denom = loss_mask.sum().clamp_min(1.0)
-                        loss = loss + z_loss_coeff * ((z_term * loss_mask).sum() / denom)
-                    else:
-                        loss = loss + z_loss_coeff * z_term.mean()
+                    loss = loss + z_loss_coeff * torch.logsumexp(
+                        logits.float(), dim=-1
+                    ).pow(2).mean()
         return logits, loss
 
     def count_parameters(self) -> int:
@@ -345,3 +472,45 @@ class ParrotLLM(nn.Module):
                 seen.add(p.data_ptr())
                 total += p.numel()
         return total
+
+    @torch.no_grad()
+    def forward_with_cache(
+        self,
+        idx: torch.Tensor,
+        cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+        """Inference forward pass with KV-cache (VL09 slides 33–35).
+
+        Args:
+            idx: ``(B, T_new)`` token ids. On the first call, ``T_new`` is
+                the prompt length (prefill). On subsequent calls, ``T_new``
+                is typically 1 (single-step decode).
+            cache: per-block list of ``(past_k, past_v)`` tensors of shape
+                ``(B, n_heads, past_T, d_head)``, or ``None`` for prefill.
+
+        Returns:
+            ``(logits, new_cache)`` where ``logits`` has shape
+            ``(B, T_new, vocab_size)`` and ``new_cache`` is the updated
+            list ready for the next call.
+
+        For PikoGPT (8 KB/token, 8 MB at T=1024) the cache is tiny, so we
+        keep it in the same dtype as the model and never offload. Drops
+        decode complexity from O(t²) to O(t) per the VL09 cheat sheet.
+        """
+        _, T_new = idx.shape
+        past_T = cache[0][0].size(-2) if cache is not None else 0
+
+        x = self.tok_emb(idx)
+
+        freqs_cis_slice = self.freqs_cis[past_T : past_T + T_new]
+
+        new_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for i, block in enumerate(self.blocks):
+            past_kv = cache[i] if cache is not None else None
+            x, new_kv = block.forward_with_cache(x, freqs_cis_slice, past_kv)
+            new_cache.append(new_kv)
+
+        if hasattr(self, "ln_f"):
+            x = self.ln_f(x)
+        logits = self.lm_head(x)
+        return logits, new_cache
